@@ -1,0 +1,337 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS EC2 Apache webserver 
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VPC
+          - RemoteAccessCIDR
+      - Label:
+          default: Linux Instance Configuration
+        Parameters:
+          - KeyPair
+          - LinuxInstanceType
+          - LatestAmiId
+    ParameterLabels:
+      VPC:
+        default: VPC
+      KeyPair:
+        default: Key Pair
+      RemoteAccessCIDR:
+        default: Remote Access CIDR Block
+      LinuxInstanceType:
+        default: Linux Instance Type
+      LatestAmiId:
+        default: SSM key to the latest Amazon linux AMI
+Parameters:
+# Valittava VPC pitää olla jo aikaisemmin luotuna
+  VPC:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: Select the VPC where the EC2 instances will be created
+    ConstraintDescription: must be an existing VPC
+# Valittava Subnet pitää olla jo aikaisemmin luotuna
+  LinuxSubnet:
+    Type: 'AWS::EC2::Subnet::Id'
+    Description: Select subnet for Linux Instance
+    ConstraintDescription: must be an existing subnet
+# KeyPair pitää olla jo aikaisemin luotuna
+  KeyPair:
+    Description: Name of existing EC2 key pair for Linux Instances
+    Type: 'AWS::EC2::KeyPair::KeyName'
+# Osoiteavaruus x.x.x.x/x josta sallitaan liikenne instansille    
+  RemoteAccessCIDR:
+    Description: CIDR block to allow access to linux instances
+    Type: String
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+# Sallitut instanssi muodot, jos tarvitset listan ulkopuolelta jotain, lisää se listaan mukaan
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t2.medium
+      - t3.micro
+      - t3.medium
+      - t3.large
+# Oletuksena käytetään viimeisintä Amazon linux distron imagea, muuta koodia jos haluat jotain muuta      
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+Resources:
+# SecurityGroup joka sallii liikenteen julki internettiin sekä hallinnan ja pingin aikaisemmin määritetystä osoitteesta
+  WebSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP and HTTPS access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: allow incoming HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: allow incoming HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: allow icmp
+          IpProtocol: icmp
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: !Ref RemoteAccessCIDR
+        - Description: allow SSH
+          IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Ref RemoteAccessCIDR
+      SecurityGroupEgress:
+        - Description: allow outgoing HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: allow outgoing HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  WebServerInstance:
+# Instanssin luominen 
+    Type: 'AWS::EC2::Instance'
+# Metadatassa asennetaan Yumin avulla httpd paketti (apache) ja lisätään sinne erillinen index.html tiedosto.
+# Lisäksi Apache käynnistetään ja asetetaan käynnistymään automaattisesti.   
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          All:
+            - ConfigureSampleApp
+        ConfigureSampleApp:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: !Join 
+                - |+
+
+                - - >-
+                    <h1>Congratulations, you have successfully launched the
+                    Apache webserver.</h1>
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+# Instanssin määritykset ovat viittauksia aikaisemmin luotuihin parametreihin
+    Properties:
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref LinuxSubnet
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPair
+      IamInstanceProfile: !Ref PatchingInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub 'EC2-Apache-${AWS::StackName}'
+      SecurityGroupIds:
+        - !GetAtt 
+          - WebSecurityGroup
+          - GroupId
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash -xe
+            - |
+              yum update -y aws-cfn-bootstrap
+            - |
+              # Install the files and packages from the metadata
+            - '/opt/aws/bin/cfn-init -v '
+            - '         --stack '
+            - !Ref 'AWS::StackName'
+            - '         --resource WebServerInstance '
+            - '         --configsets All '
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+            - |
+              # Signal the status from cfn-init
+            - '/opt/aws/bin/cfn-signal -e $? '
+            - '         --stack '
+            - !Ref 'AWS::StackName'
+            - '         --resource WebServerInstance '
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+# Rooli joka sallii Systems Manager yhteyden päivityksiä varten  
+  InstancePatchingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
+        - 'arn:aws:iam::aws:policy/AmazonSSMFullAccess'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+# Rooli joka sallii Kriittisten päivitysten automaattisen asennuksen.              
+  PatchingInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstancePatchingRole
+  LinuxPatchBaseline:
+    Type: 'AWS::SSM::PatchBaseline'
+    Properties:
+      OperatingSystem: AMAZON_LINUX
+      ApprovalRules:
+        PatchRules:
+          - ApproveAfterDays: 0
+            ComplianceLevel: CRITICAL
+            EnableNonSecurity: true
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: PRODUCT
+                  Values:
+                    - '*'
+                - Key: CLASSIFICATION
+                  Values:
+                    - Security
+                    - Bugfix
+                    - Enhancement
+                    - Recommended
+                - Key: SEVERITY
+                  Values:
+                    - Critical
+                    - Important
+                    - Medium
+                    - Low
+      Description: >-
+        Service Catalog EC2 Reference Architecture Patch Baseline for Amazon
+        Linux instace
+      Name: sc-ec2-ra-linux-patch-baseline
+  MaintenanceWindowRole:
+# Rooli päivitysten aikaikkunalle
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonSSMMaintenanceWindowRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+# Päivitysten ajaminen cronin avulla 
+  MaintenanceWindow:
+    Type: 'AWS::SSM::MaintenanceWindow'
+    Properties:
+      Description: Maintenance window to allow for patching Amazon Linux instances
+      AllowUnassociatedTargets: false
+      Cutoff: 2
+      Schedule: cron(* 17 * * ? *)
+      Duration: 6
+      Name: sc-ec2-ra-linux-maintenance-window
+  LinuxMainteanceWindowTarget:
+    Type: 'AWS::SSM::MaintenanceWindowTarget'
+    Properties:
+      OwnerInformation: Service Catalog EC2 Reference Architecture
+      Description: >-
+        Service Catalog EC2 Reference Architecture - Patch Maintenance for
+        Amazon Linux Instances
+      WindowId: !Ref MaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref WebServerInstance
+      Name: sc-ec2-ra-linux-patch-targets
+  LinuxMaintenanceWindowTaskScan:
+    Type: 'AWS::SSM::MaintenanceWindowTask'
+    Properties:
+      MaxErrors: 1
+      Description: >-
+        Service Catalog EC2 Reference Architecture Maintenance Window Task: Scan
+        for update for Amazon Linux Instance
+      ServiceRoleArn: !GetAtt 
+        - MaintenanceWindowRole
+        - Arn
+      Priority: 1
+      MaxConcurrency: 1
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref WebServerInstance
+      Name: patch-sc-ec2-ra-linux-nginx-instances
+      TaskArn: AWS-RunPatchBaseline
+      WindowId: !Ref MaintenanceWindow
+      TaskParameters:
+        Operation:
+          Values:
+            - Scan
+      TaskType: RUN_COMMAND
+  LinuxMaintenanceWindowTaskInstall:
+    Type: 'AWS::SSM::MaintenanceWindowTask'
+    Properties:
+      MaxErrors: 1
+      Description: >-
+        Service Catalog EC2 RA Maintenance Window Task: Install update for
+        Amazon Linux Instance
+      ServiceRoleArn: !GetAtt 
+        - MaintenanceWindowRole
+        - Arn
+      Priority: 2
+      MaxConcurrency: 1
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref WebServerInstance
+      Name: patch-sc-ec2-ra-linux-nginx-instances
+      TaskArn: AWS-RunPatchBaseline
+      WindowId: !Ref MaintenanceWindow
+      TaskParameters:
+        Operation:
+          Values:
+            - Install
+      TaskType: RUN_COMMAND
+Outputs:
+# Outputin tulee palvelimen URL ja IP tiedot
+  WebsiteURL:
+    Description: DNS root URL of the new webserver
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - WebServerInstance
+          - PublicDnsName
+  WebsiteIP:
+    Description: IP root URL of the new webserver
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - WebServerInstance
+          - PublicIp
